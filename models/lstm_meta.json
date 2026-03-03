@@ -1,0 +1,35 @@
+{
+  "features": [
+    "mid_rate",
+    "range_pct",
+    "duration_days",
+    "pre_trend_pct",
+    "days_from_bottom",
+    "high_rate",
+    "low_rate",
+    "cycle_bottom_rate",
+    "phase_enc",
+    "box_number",
+    "cycle_number"
+  ],
+  "seq_len": 4,
+  "input_size": 11,
+  "hidden_size": 64,
+  "num_layers": 2,
+  "dropout": 0.3,
+  "norm_stats": {
+    "global_mu_mean": 13.958,
+    "global_mu_std": 13.549,
+    "global_mn_mean": 13.9922,
+    "global_mn_std": 10.0258
+  },
+  "best_epoch": 38,
+  "best_val_f1": 68.72,
+  "test_acc": 65.77,
+  "test_f1": 62.97,
+  "test_prec": 61.02,
+  "test_rec": 65.06,
+  "test_dn_acc": 66.34,
+  "mae_up": 9.4139,
+  "mae_dn": 6.7937
+}

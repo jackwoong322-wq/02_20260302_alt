@@ -1,0 +1,1627 @@
+// ── Data ──────────────────────────────────────────────
+const ALL_DATA = {};
+// BTC 기준축용 코인 ID (symbol === 'BTC')
+const BTC_COIN_ID = Object.keys(ALL_DATA).find(
+  id => (ALL_DATA[id]?.symbol || '').toUpperCase() === 'BTC'
+) || null;
+
+// ── Cycle Colors ──────────────────────────────────────
+const CYCLE_COLORS = {
+  1: { main:'#FF4D4D', band:'rgba(255,77,77,0.08)'  },
+  2: { main:'#00C8FF', band:'rgba(0,200,255,0.08)'  },
+  3: { main:'#FFB800', band:'rgba(255,184,0,0.08)'  },
+  4: { main:'#7CFF6B', band:'rgba(124,255,107,0.08)'},
+  5: { main:'#FF69B4', band:'rgba(255,105,180,0.08)'},
+};
+
+const SCENARIO_STYLE = {
+  es:    { line:'rgba(255,184,0,0.85)',  fill:'rgba(255,184,0,0.10)',
+           dot:'#FFB800', lbl:'#FFD700', tag:'(ES)'  },
+  plus:  { line:'rgba(0,255,136,0.85)', fill:'rgba(0,255,136,0.08)',
+           dot:'#00ff88', lbl:'#66ffaa', tag:'(+1σ)' },
+  minus: { line:'rgba(255,68,102,0.85)',fill:'rgba(255,68,102,0.08)',
+           dot:'#ff4466', lbl:'#ff8899', tag:'(-1σ)' },
+};
+
+function getScenarioKey(result) {
+  if (!result) return 'es';
+  const r = (result || '').toUpperCase();
+  if (r.includes('_PLUS')  || r.includes('CHAIN_PLUS'))  return 'plus';
+  if (r.includes('_MINUS') || r.includes('CHAIN_MINUS')) return 'minus';
+  return 'es';
+}
+
+const COIN_COLORS = [
+  '#00D4FF','#FF6B35','#A8FF3E','#FF3CAC','#784BA0',
+  '#2B86C5','#FFD700','#FF6B6B','#4ECDC4','#45B7D1',
+];
+
+// ── State ─────────────────────────────────────────────
+let selectedCoins  = BTC_COIN_ID ? [BTC_COIN_ID] : [];
+let activeCycles   = new Set([1,2,3,4,5]);
+let showHighLow    = false;
+let showBoxZone    = true;
+let showBearBull   = false;
+let bearBullLabels = [];
+let boxMarkEls     = [];
+let boxMarksData   = [];
+let chart          = null;
+let seriesMap      = {};
+let seriesMetaMap  = {};
+
+let boxRedrawTimer = null;
+function scheduleRedrawBoxMarks() {
+  if (boxMarksData.length === 0) return;
+  if (boxRedrawTimer !== null) {
+    cancelAnimationFrame(boxRedrawTimer);
+  }
+  boxRedrawTimer = requestAnimationFrame(() => {
+    boxRedrawTimer = null;
+    redrawBoxMarks();
+  });
+}
+
+function redrawBoxMarks() {
+  if (boxMarksData.length === 0) return;
+  clearBoxMarks();
+  boxMarksData.forEach(d => {
+    const series = seriesMap[d.seriesKey];
+    if (!series) return;
+    const ts = chart.timeScale();
+    renderBoxMarks(
+      d.zones,
+      d.cycleLowIdx,
+      d.cycleData,
+      ts,
+      series,
+      d.coinId,
+      d.symbol,
+      d.cycleNumber,
+      d.cycleRef
+    );
+  });
+}
+
+// ── Init Chart ────────────────────────────────────────
+function initChart() {
+  const el = document.getElementById('chart');
+  chart = LightweightCharts.createChart(el, {
+    layout: {
+      background: { color: '#080c14' },
+      textColor:  '#c8d8f0',
+    },
+    grid: {
+      vertLines: { color: '#1e2d45' },
+      horzLines: { color: '#1e2d45' },
+    },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: {
+      borderColor: '#1e2d45',
+      scaleMargins: { top: 0.05, bottom: 0.05 },
+    },
+    localization: {
+      timeFormatter: v => `Day ${v}`,
+    },
+    timeScale: {
+      borderColor: '#1e2d45',
+      tickMarkFormatter: v => `Day ${v}`,
+    },
+    handleScroll: true,
+    handleScale:  true,
+  });
+
+  new ResizeObserver(() => {
+    if (chart) {
+      chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+      scheduleRedrawBoxMarks();
+    }
+  }).observe(el);
+
+  chart.timeScale().subscribeVisibleTimeRangeChange(() => scheduleRedrawBoxMarks());
+  chart.timeScale().subscribeVisibleLogicalRangeChange(() => scheduleRedrawBoxMarks());
+}
+
+// ── BTC 하락 우선 판단 (Lower Low / 강한 BEAR 박스) ──────────────────────
+function isBtcBearDominant(cycleNumber) {
+  if (!BTC_COIN_ID) return false;
+  const btc = ALL_DATA[BTC_COIN_ID];
+  if (!btc || !btc.cycles) return false;
+  const cyc = btc.cycles.find(c => c.cycle_number === cycleNumber)
+    || btc.cycles.find(c => (c.cycle_name || '').toLowerCase().includes('current'));
+  if (!cyc) return false;
+  const zones = cyc.box_zones || [];
+  if (zones.length < 2) return false;
+  const last = zones[zones.length - 1];
+  const prev = zones[zones.length - 2];
+  const lowerLow = last.lo < prev.lo;
+  const strongBear = last.phase === 'BEAR' && parseFloat(last.rangePct || '0') < 0;
+  return lowerLow || strongBear;
+}
+
+// ── Build Coin List ───────────────────────────────────
+function buildCoinList(filter='') {
+  const el   = document.getElementById('coinList');
+  el.innerHTML = '';
+  const keys = Object.keys(ALL_DATA).filter(id => {
+    const d = ALL_DATA[id];
+    return d.symbol.toLowerCase().includes(filter.toLowerCase()) ||
+           d.name.toLowerCase().includes(filter.toLowerCase());
+  });
+
+  keys.forEach(id => {
+    const d    = ALL_DATA[id];
+    const sel  = selectedCoins.includes(id);
+    const div  = document.createElement('div');
+    div.className = 'coin-item' + (sel ? ' checked active' : '');
+    div.dataset.id = id;
+    div.innerHTML = `
+      <div class="coin-check">
+        <svg width="8" height="8" viewBox="0 0 8 8">
+          <polyline points="1,4 3,6 7,2" fill="none" stroke="#080c14" stroke-width="1.5"/>
+        </svg>
+      </div>
+      <span class="coin-rank">#${d.rank||'?'}</span>
+      <span class="coin-symbol">${d.symbol}</span>
+      <span class="coin-name">${d.name}</span>
+    `;
+    div.onclick = () => toggleCoin(id, div);
+    el.appendChild(div);
+  });
+}
+
+function toggleCoin(id, el) {
+  const idx = selectedCoins.indexOf(id);
+  if (idx >= 0) {
+    selectedCoins.splice(idx, 1);
+    el.classList.remove('checked','active');
+  } else {
+    selectedCoins.push(id);
+    el.classList.add('checked','active');
+  }
+}
+
+function clearAll() {
+  selectedCoins = [];
+  buildCoinList(document.getElementById('searchInput').value);
+  drawChart();
+}
+
+// ── Cycle Toggles ─────────────────────────────────────
+function buildCycleToggles() {
+  const el = document.getElementById('cycleToggles');
+  el.innerHTML = '';
+  const cycleNums = new Set();
+  selectedCoins.forEach(id => {
+    (ALL_DATA[id]?.cycles||[]).forEach(c => cycleNums.add(c.cycle_number));
+  });
+  if (cycleNums.size === 0) {
+    [1,2,3,4,5].forEach(n => cycleNums.add(n));
+  }
+  [...cycleNums].sort().forEach(n => {
+    const col  = CYCLE_COLORS[n] || CYCLE_COLORS[1];
+    let name = `CYCLE ${n}`;
+    for (const id of selectedCoins) {
+      const found = (ALL_DATA[id]?.cycles || []).find(c => c.cycle_number === n);
+      if (found) { name = found.cycle_name.toUpperCase(); break; }
+    }
+    if (cycleNums.size === 0 || selectedCoins.length === 0) {
+      name = n === 5 ? 'CURRENT' : `CYCLE ${n}`;
+    }
+    const btn  = document.createElement('button');
+    btn.className = 'cycle-btn';
+    const active = activeCycles.has(n);
+    btn.style.cssText = active
+      ? `border-color:${col.main};color:${col.main};background:${col.band}`
+      : `border-color:#1e2d45;color:#4a6080;background:transparent`;
+    btn.textContent = name;
+    btn.onclick = () => {
+      if (activeCycles.has(n)) activeCycles.delete(n);
+      else activeCycles.add(n);
+      buildCycleToggles();
+      drawChart();
+    };
+    el.appendChild(btn);
+  });
+}
+
+function toggleHighLow() {
+  showHighLow = !showHighLow;
+  const btn = document.getElementById('toggleRange');
+  btn.style.cssText = showHighLow
+    ? 'border-color:#00d4ff;color:#00d4ff;background:rgba(0,212,255,0.1)'
+    : 'border-color:#4a6080;color:#4a6080;';
+  drawChart();
+}
+
+// ── Box Zone 감지 (JS 폴백 — DB 데이터 없을 때 사용) ─────────────────────
+const MIN_BOX_DAYS = 5;
+const BEAR_BREAKOUT_RATIO = 0.98;
+const BULL_BREAKOUT_RATIO = 1.10;
+const BEAR_REBOUND_RATIO = 1.05;
+const BULL_DRAWDOWN_RATIO = 0.95;
+const BULL_PEAK_LOOKAHEAD_DAYS = 15;
+
+function detectBoxZones(data) {
+  const zones = [];
+  if (!data || data.length < 2) return zones;
+
+  let cycleMinLow = Infinity, cycleMinIdx = 0;
+  data.forEach((d, i) => {
+    if (d.low < cycleMinLow) { cycleMinLow = d.low; cycleMinIdx = i; }
+  });
+
+  const phase1 = data.slice(0, cycleMinIdx + 1);
+  const phase2 = data.slice(cycleMinIdx);
+
+  let i = 0;
+  while (i < phase1.length - 1) {
+    let troughIdx = -1;
+    for (let k = i; k < phase1.length; k++) {
+      const candLow = phase1[k].low;
+      const confirmEnd = Math.min(phase1.length - 1, k + 3);
+      let broken3 = false;
+      for (let m = k + 1; m <= confirmEnd; m++) {
+        if (phase1[m].low < candLow) { broken3 = true; break; }
+      }
+      if (!broken3) { troughIdx = k; break; }
+    }
+    if (troughIdx === -1) break;
+
+    const baseLow = phase1[troughIdx].low;
+    let reboundIdx = -1;
+    for (let k = troughIdx + 1; k < phase1.length; k++) {
+      if (phase1[k].high >= baseLow * BEAR_REBOUND_RATIO) { reboundIdx = k; break; }
+    }
+    if (reboundIdx === -1) { i = troughIdx + 1; continue; }
+
+    let boxHi = -Infinity, boxLo = Infinity;
+    for (let k = troughIdx; k <= reboundIdx; k++) {
+      boxHi = Math.max(boxHi, phase1[k].high);
+      boxLo = Math.min(boxLo, phase1[k].low);
+    }
+    const loDayX = phase1[troughIdx].x;
+    const hiDayX = phase1[reboundIdx].x;
+    const boxStart = troughIdx;
+    let   boxEnd   = reboundIdx;
+    let   broken   = false;
+
+    for (let j = reboundIdx + 1; j < phase1.length; j++) {
+      if (phase1[j].close < boxLo * BEAR_BREAKOUT_RATIO) {
+        const duration = phase1[j - 1].x - phase1[boxStart].x + 1;
+        if (duration >= MIN_BOX_DAYS) {
+          zones.push({ startX: phase1[boxStart].x, endX: phase1[j-1].x,
+            hi: boxHi, lo: boxLo, loDay: loDayX, hiDay: hiDayX,
+            duration, rangePct: ((boxHi-boxLo)/boxLo*100).toFixed(1),
+            phase: 'BEAR', result: 'DOWN', is_prediction: 0 });
+        }
+        i = j; broken = true; break;
+      }
+      boxHi = Math.max(boxHi, phase1[j].high);
+      boxLo = Math.min(boxLo, phase1[j].low);
+      boxEnd = j;
+    }
+    if (!broken) {
+      const duration = phase1[boxEnd].x - phase1[boxStart].x + 1;
+      if (duration >= MIN_BOX_DAYS) {
+        zones.push({ startX: phase1[boxStart].x, endX: phase1[boxEnd].x,
+          hi: boxHi, lo: boxLo, loDay: loDayX, hiDay: hiDayX,
+          duration, rangePct: ((boxHi-boxLo)/boxLo*100).toFixed(1),
+          phase: 'BEAR', result: 'BOTTOM', is_prediction: 0 });
+      }
+      break;
+    }
+  }
+
+  function bullBoxHiLo(phase2, boxStart, boxEnd) {
+    let loIdx = boxStart;
+    for (let k = boxStart+1; k <= boxEnd; k++) {
+      if (phase2[k].low < phase2[loIdx].low) loIdx = k;
+    }
+    const loDayX = phase2[loIdx].x;
+    const boxLo  = phase2[loIdx].low;
+    let hiIdx = boxStart;
+    for (let k = boxStart; k < loIdx; k++) {
+      if (phase2[k].high > phase2[hiIdx].high) hiIdx = k;
+    }
+    const hiDayX = phase2[hiIdx].x;
+    const boxHi  = phase2[hiIdx].high;
+    return { boxHi, boxLo, hiDayX, loDayX };
+  }
+
+  i = 0;
+  for (let _guard = 0; _guard < 300 && i < phase2.length - 1; _guard++) {
+    let peakIdx = -1;
+    for (let k = i; k < phase2.length - 1; k++) {
+      const hi = Math.min(phase2.length - 1, k + BULL_PEAK_LOOKAHEAD_DAYS);
+      let isPeak = true;
+      for (let m = k + 1; m <= hi; m++) {
+        if (phase2[m].high >= phase2[k].high) { isPeak = false; break; }
+      }
+      if (isPeak) { peakIdx = k; break; }
+    }
+    if (peakIdx === -1) break;
+
+    const peakHi = phase2[peakIdx].high;
+    let adjIdx = -1;
+    for (let k = peakIdx + 1; k < phase2.length; k++) {
+      if (phase2[k].low <= peakHi * BULL_DRAWDOWN_RATIO) { adjIdx = k; break; }
+    }
+    if (adjIdx === -1) break;
+
+    const boxStart = peakIdx;
+    let   boxEnd   = adjIdx;
+    let   broken   = false;
+    const breakoutThreshold = peakHi * BULL_BREAKOUT_RATIO;
+
+    for (let j = adjIdx + 1; j < phase2.length; j++) {
+      if (phase2[j].close > breakoutThreshold) {
+        const endIdx  = j - 1;
+        const duration = phase2[endIdx].x - phase2[boxStart].x + 1;
+        if (duration >= MIN_BOX_DAYS) {
+          const { boxHi, boxLo, hiDayX, loDayX } = bullBoxHiLo(phase2, boxStart, endIdx);
+          zones.push({ startX: phase2[boxStart].x, endX: phase2[endIdx].x,
+            hi: boxHi, lo: boxLo, hiDay: hiDayX, loDay: loDayX,
+            duration, rangePct: ((boxHi-boxLo)/boxLo*100).toFixed(1),
+            phase: 'BULL', result: 'UP', is_prediction: 0 });
+        }
+        i = j; broken = true; break;
+      }
+      boxEnd = j;
+    }
+    if (!broken) {
+      const duration = phase2[boxEnd].x - phase2[boxStart].x + 1;
+      if (duration >= MIN_BOX_DAYS) {
+        const { boxHi, boxLo, hiDayX, loDayX } = bullBoxHiLo(phase2, boxStart, boxEnd);
+        zones.push({ startX: phase2[boxStart].x, endX: phase2[boxEnd].x,
+          hi: boxHi, lo: boxLo, hiDay: hiDayX, loDay: loDayX,
+          duration, rangePct: ((boxHi-boxLo)/boxLo*100).toFixed(1),
+          phase: 'BULL', result: 'ACTIVE', is_prediction: 0 });
+      }
+      break;
+    }
+  }
+  return zones;
+}
+
+function toggleBoxZone() {
+  showBoxZone = !showBoxZone;
+  const btn = document.getElementById('toggleBox');
+  btn.style.cssText = showBoxZone
+    ? 'border-color:#FFB800;color:#FFB800;background:rgba(255,184,0,0.1)'
+    : 'border-color:#4a6080;color:#4a6080;';
+  drawChart();
+}
+
+// ── Bear/Bull 감지 ───────────────────────────────────
+function detectBearBull(data) {
+  if (!data || data.length === 0) return [];
+  let minVal = Infinity, minIdx = 0;
+  data.forEach((d, i) => {
+    if (d.close < minVal) { minVal = d.close; minIdx = i; }
+  });
+  const bottomDay = data[minIdx].x;
+  const startDay  = data[0].x;
+  const endDay    = data[data.length - 1].x;
+  const segments  = [];
+  if (minIdx > 5) {
+    segments.push({ type: 'BEAR', startX: startDay, endX: bottomDay,
+      startVal: data[0].close, endVal: minVal,
+      pct: (((minVal - data[0].close) / data[0].close) * 100).toFixed(1),
+      days: bottomDay - startDay });
+  }
+  if (minIdx < data.length - 5) {
+    const lastVal = data[data.length - 1].close;
+    segments.push({ type: 'BULL', startX: bottomDay, endX: endDay,
+      startVal: minVal, endVal: lastVal,
+      pct: (((lastVal - minVal) / minVal) * 100).toFixed(1),
+      days: endDay - bottomDay });
+  }
+  return segments;
+}
+
+function clearBoxMarks() {
+  const overlay = document.getElementById('boxMarksOverlay');
+  if (overlay) overlay.innerHTML = '';
+  boxMarkEls = [];
+}
+
+// ── renderBoxMarks ────────────────────────────────────
+// isPrediction 조건 추가:
+//   - is_prediction=1 인 박스: 마크 반투명 + 'PRED' 접두 라벨
+// BTC 기준축 정보 계산
+function getBtcAnchorInfo(cycleNumber) {
+  if (!BTC_COIN_ID) return null;
+  const btc = ALL_DATA[BTC_COIN_ID];
+  if (!btc || !btc.cycles) return null;
+  let cyc = btc.cycles.find(c => c.cycle_number === cycleNumber);
+  if (!cyc) {
+    cyc = btc.cycles.find(c => (c.cycle_name || '').toLowerCase().includes('current'));
+  }
+  if (!cyc || !cyc.data || cyc.data.length === 0) return null;
+  const last = cyc.data[cyc.data.length - 1];
+  const AVG_BTC_CYCLE_DAYS = 365;
+  const progress = Math.min(last.x / AVG_BTC_CYCLE_DAYS, 1.0);
+  let level = 'LOW';
+  if (progress >= 0.85) level = 'HIGH';
+  else if (progress >= 0.65) level = 'MID';
+  const label = level === 'HIGH' ? 'High Risk'
+               : level === 'MID' ? 'Caution'
+               : 'Normal';
+  return { progress, level, label };
+}
+
+// 현재 코인/phase 기준 과거 사이클 박스 통계
+function getPhaseBoxStatsForSymbol(symbol, phase) {
+  const coinId = Object.keys(ALL_DATA).find(
+    id => (ALL_DATA[id]?.symbol || '').toUpperCase() === symbol.toUpperCase()
+  );
+  if (!coinId) return null;
+  const d = ALL_DATA[coinId];
+  if (!d || !d.cycles) return null;
+  const counts = [];
+  d.cycles.forEach(c => {
+    const zs = c.box_zones || [];
+    const cnt = zs.filter(z => z.phase === phase && !z.is_prediction).length;
+    if (cnt > 0) counts.push(cnt);
+  });
+  if (!counts.length) return null;
+  const sum = counts.reduce((a, b) => a + b, 0);
+  const avg = sum / counts.length;
+  const max = Math.max(...counts);
+  return { avg, max };
+}
+
+function renderBoxMarks(zones, cycleLowIdx, cycleData, timeScale, series, coinId, coinSymbol, cycleNumber, cycleRef) {
+  const overlay = document.getElementById('boxMarksOverlay');
+  if (!overlay) return;
+
+  const tooltip = document.getElementById('crosshairTooltip');
+  const chartEl = document.getElementById('chart');
+
+  const cycleLow = cycleData[cycleLowIdx]?.low ?? null;
+  const firstBullZi = zones.findIndex(z => z.phase === 'BULL');
+
+  const btcAnchor = getBtcAnchorInfo(cycleNumber);
+  const phaseBoxStats = getPhaseBoxStatsForSymbol(coinSymbol, 'BULL'); // BULL/Bear 모두 참고
+  const isBtcChart = (coinSymbol || '').toUpperCase() === 'BTC';
+
+  if (showBoxZone && zones.length > 0) {
+  zones.forEach((z, zi) => {
+    const isBear      = z.phase === 'BEAR';
+    const isPrediction = z.is_prediction === 1;   // ★ 예측 박스 플래그
+    const isActive     = !isPrediction && (z.result === 'BEAR_ACTIVE' || z.result === 'BULL_ACTIVE');
+    const isActiveBear = z.result === 'BEAR_ACTIVE';  // predict.py가 BEAR로 판정한 ACTIVE 박스
+
+    const prevBox = zones[zi - 1] || null;
+    const refHighForLow = isBear ? (prevBox ? prevBox.hi : 100) : z.hi;
+    const refLowForHigh = isBear
+      ? z.lo
+      : (zi === firstBullZi && cycleLow != null ? cycleLow : (prevBox ? prevBox.lo : 100));
+
+    let hiDay, loDay;
+    if (isPrediction) {
+      // 예측 박스: 실제 데이터 없음 → DB hi_day/lo_day 우선, 없으면 기간 추정
+      const dur = z.endX - z.startX;
+      hiDay = z.hiDay != null ? z.hiDay : z.startX + Math.floor(dur / 4);
+      loDay = z.loDay != null ? z.loDay : z.startX + Math.floor(dur * 3 / 4);
+    } else if (isBear && z.loDay != null) {
+      loDay = z.loDay;
+      let bestHi = -Infinity;
+      hiDay = z.endX;
+      for (const d of cycleData) {
+        if (d.x > z.loDay && d.x <= z.endX) {
+          if (d.high > bestHi) { bestHi = d.high; hiDay = d.x; }
+        }
+      }
+    } else if (!isBear && z.hiDay != null) {
+      hiDay = z.hiDay;
+      let bestLo = Infinity;
+      loDay = z.loDay != null ? z.loDay : z.endX;
+      for (const d of cycleData) {
+        if (d.x > z.hiDay && d.x <= z.endX) {
+          if (d.low < bestLo) { bestLo = d.low; loDay = d.x; }
+        }
+      }
+    } else {
+      let bestHi = -Infinity, bestLo = Infinity;
+      hiDay = z.startX; loDay = z.startX;
+      for (const d of cycleData) {
+        if (d.x >= z.startX && d.x <= z.endX) {
+          if (d.high > bestHi) { bestHi = d.high; hiDay = d.x; }
+          if (d.low  < bestLo) { bestLo = d.low;  loDay = d.x; }
+        }
+      }
+    }
+
+    const hiData = cycleData.find(d => d.x === hiDay);
+    const loData = cycleData.find(d => d.x === loDay);
+    const hiDate = hiData ? hiData.date : '';
+    const loDate = loData ? loData.date : '';
+    // REFACTORED: validate hi/lo day are within box range before tooltip display
+    const hiDayDisp = (z.hiDay != null && z.hiDay >= z.startX && z.hiDay <= z.endX) ? z.hiDay : '-';
+    const loDayDisp = (z.loDay != null && z.loDay >= z.startX && z.loDay <= z.endX) ? z.loDay : '-';
+    const hiDateDisp = hiDayDisp !== '-' ? (cycleData.find(d => d.x === hiDayDisp)?.date ?? '') : '';
+    const loDateDisp = loDayDisp !== '-' ? (cycleData.find(d => d.x === loDayDisp)?.date ?? '') : '';
+
+    // 1일당 픽셀 추정 헬퍼
+    function estimatePixelsPerDay(ts, data) {
+      if (data.length < 2) return 5;
+      const x1 = ts.timeToCoordinate(data[data.length - 2].x);
+      const x2 = ts.timeToCoordinate(data[data.length - 1].x);
+      if (x1 === null || x2 === null) return 5;
+      return Math.abs(x2 - x1);
+    }
+
+    // y좌표 안전 변환 헬퍼 (가시 범위 기반 보간)
+    function priceToCoordSafe(price) {
+      const coord = series.priceToCoordinate(price);
+      if (coord !== null) return coord;
+      try {
+        const ps    = chart.priceScale('right');
+        const range = ps.getVisiblePriceRange();
+        if (!range) return null;
+        const h     = document.getElementById('chart').clientHeight;
+        return ((range.maxValue - price) / (range.maxValue - range.minValue)) * h;
+      } catch(e) { return null; }
+    }
+
+    const lastReal  = cycleData[cycleData.length - 1];
+    const lastRealX = lastReal ? timeScale.timeToCoordinate(lastReal.x) : null;
+    const pxPerDay  = estimatePixelsPerDay(timeScale, cycleData);
+
+    let xHi = timeScale.timeToCoordinate(hiDay);
+    if (xHi === null && isPrediction && lastRealX !== null)
+      xHi = lastRealX + (hiDay - lastReal.x) * pxPerDay;
+
+    let xLo = timeScale.timeToCoordinate(loDay);
+    if (xLo === null && isPrediction && lastRealX !== null)
+      xLo = lastRealX + (loDay - lastReal.x) * pxPerDay;
+
+    // 예측 박스는 실제 캔들 없음 → z.hi/z.lo(박스 경계값) 사용
+    // 실제 박스는 hiDay/loDay의 캔들 high/low 사용
+    const yHi = isPrediction ? priceToCoordSafe(z.hi) : priceToCoordSafe(hiData ? hiData.high : z.hi);
+    const yLo = isPrediction ? priceToCoordSafe(z.lo) : priceToCoordSafe(loData ? loData.low  : z.lo);
+
+    // null 체크: 예측 박스는 x만 체크, 실제 박스는 전부 체크
+    if (isPrediction) {
+      if (xHi === null || xLo === null) return;
+    } else {
+      if (xHi === null || yHi === null || xLo === null || yLo === null) return;
+    }
+
+    const hiVsPrevLo = refLowForHigh != null ? ((z.hi - refLowForHigh) / refLowForHigh * 100).toFixed(1) : null;
+    const loVsPrevHi = ((z.lo - refHighForLow) / refHighForLow * 100).toFixed(1);
+
+    // ── 색상 정의 (예측: 시나리오별 / 실제: BEAR/BULL 분기 / ACTIVE: 판정 결과 기준) ──
+    const sKey   = isPrediction ? getScenarioKey(z.result) : null;
+    const sStyle = sKey ? SCENARIO_STYLE[sKey] : null;
+
+    // ACTIVE 박스는 predict.py 판정(BEAR_ACTIVE/BULL_ACTIVE) 기준으로 색상 결정
+    const effectiveBear = isActive ? isActiveBear : isBear;
+
+    // 예측 박스: 주황(BEAR) / 청록(BULL) — 실제 박스(빨강/노랑)와 구분
+    // 실제 박스보다 밝은 톤으로 차별화
+    const hiDotColor = isPrediction
+      ? (effectiveBear ? '#FF6B6B' : '#FFD966')
+      : (effectiveBear ? '#ff4466' : '#FFB800');
+    const hiDotBg = isPrediction
+      ? (effectiveBear ? 'rgba(255,107,107,0.30)' : 'rgba(255,217,102,0.30)')
+      : (effectiveBear ? 'rgba(255,68,102,0.35)' : 'rgba(255,184,0,0.35)');
+    const loDotColor = isPrediction ? '#66FFBB' : '#00ff88';
+    const loDotBg    = isPrediction ? 'rgba(102,255,187,0.25)' : 'rgba(0,255,136,0.25)';
+    const hiLblColor = isPrediction
+      ? (effectiveBear ? '#FF6B6B' : '#FFD966')
+      : (effectiveBear ? '#ff6688' : '#FFD700');
+    const loLblColor = isPrediction ? '#66FFBB' : '#00ff88';
+    const scenTag    = sStyle ? ' ' + sStyle.tag : '';
+    // ACTIVE 박스는 점선 스타일 적용 (예측처럼 보이게)
+    const useDashed  = isPrediction || isActive;
+
+    // ── 고점 dot ──
+    const dotHi = document.createElement('div');
+    dotHi.className = 'bz-mark' + (useDashed ? ' prediction' : '');
+    dotHi.innerHTML = `<div class="bz-dot" style="background:${hiDotBg};border-color:${hiDotColor};width:9px;height:9px;${useDashed ? 'border-style:dashed;' : ''}"></div>`;
+    dotHi.style.left = xHi + 'px';
+    dotHi.style.top  = (yHi ?? 0) + 'px';
+    overlay.appendChild(dotHi);
+    boxMarkEls.push(dotHi);
+
+    // ── 고점 레이블 ──
+    const lblHi = document.createElement('div');
+    lblHi.className = 'bz-label' + (isPrediction ? ' prediction' : '');
+    lblHi.style.color = hiLblColor;
+    let hiText;
+    if (isPrediction) {
+      const chg = hiVsPrevLo !== null
+        ? ` ${parseFloat(hiVsPrevLo) >= 0 ? '+' : ''}${parseFloat(hiVsPrevLo).toFixed(1)}%`
+        : '';
+      hiText = `H${z.boxIndex != null ? z.boxIndex+1 : zi+1} ${z.hi.toFixed(1)}%${chg}`;
+    } else {
+      const chg = hiVsPrevLo !== null
+        ? ` ${parseFloat(hiVsPrevLo) >= 0 ? '+' : ''}${parseFloat(hiVsPrevLo).toFixed(1)}%`
+        : '';
+      hiText = `H${zi+1} ${z.hi.toFixed(1)}%${chg}`;
+    }
+    lblHi.textContent = hiText;
+    lblHi.style.left = (xHi + 10) + 'px';
+    const yBoxHi = priceToCoordSafe(z.hi);
+    let topHi = Math.max(2, (yBoxHi ?? (yHi ?? 0)) - 18);
+    if (isPrediction) topHi += (zi % 3) * 8;
+    lblHi.style.top  = topHi + 'px';
+    overlay.appendChild(lblHi);
+    boxMarkEls.push(lblHi);
+
+    // ── 저점 dot ──
+    const dotLo = document.createElement('div');
+    dotLo.className = 'bz-mark' + (useDashed ? ' prediction' : '');
+    dotLo.innerHTML = `<div class="bz-dot" style="background:${loDotBg};border-color:${loDotColor};width:9px;height:9px;${useDashed ? 'border-style:dashed;' : ''}"></div>`;
+    dotLo.style.left = xLo + 'px';
+    dotLo.style.top  = (yLo ?? 0) + 'px';
+    overlay.appendChild(dotLo);
+    boxMarkEls.push(dotLo);
+
+    // ── 저점 레이블 ──
+    const lblLo = document.createElement('div');
+    lblLo.className = 'bz-label' + (isPrediction ? ' prediction' : '');
+    lblLo.style.color = loLblColor;
+    let loText;
+    if (isPrediction) {
+      const chg = loVsPrevHi !== null
+        ? ` ${parseFloat(loVsPrevHi) >= 0 ? '+' : ''}${parseFloat(loVsPrevHi).toFixed(1)}%`
+        : '';
+      loText = `L${z.boxIndex != null ? z.boxIndex+1 : zi+1} ${z.lo.toFixed(1)}%${chg}`;
+    } else {
+      const chg = loVsPrevHi !== null
+        ? ` ${parseFloat(loVsPrevHi) >= 0 ? '+' : ''}${parseFloat(loVsPrevHi).toFixed(1)}%`
+        : '';
+      loText = `L${zi+1} ${z.lo.toFixed(1)}%${chg}`;
+    }
+    lblLo.textContent = loText;
+    lblLo.style.left = (xLo + 10) + 'px';
+    const yBoxLo = priceToCoordSafe(z.lo);
+    let topLo = ((yBoxLo ?? (yLo ?? 0)) + 6);
+    if (isPrediction) topLo += (zi % 3) * 8;
+    lblLo.style.top  = topLo + 'px';
+    overlay.appendChild(lblLo);
+    boxMarkEls.push(lblLo);
+
+    // 툴팁 히트박스
+    [dotHi, dotLo].forEach((dot) => {
+      dot.style.pointerEvents = 'all';
+      dot.addEventListener('mouseenter', (e) => {
+        const hiChg = hiVsPrevLo !== null
+          ? `<span class="${parseFloat(hiVsPrevLo)>=0?'bt-up':'bt-down'}">${parseFloat(hiVsPrevLo) >= 0 ? '+':''}${hiVsPrevLo}%</span>`
+          : '<span style="color:#666">-</span>';
+        const loChg = loVsPrevHi !== null
+          ? `<span class="${parseFloat(loVsPrevHi)>=0?'bt-up':'bt-down'}">${parseFloat(loVsPrevHi) >= 0 ? '+':''}${loVsPrevHi}%</span>`
+          : '<span style="color:#666">-</span>';
+        // BTC 기준축 및 박스 통계 기반 판단 근거
+        let reasonLine = '';
+        if (isPrediction) {
+          let btcText = '';
+          if (btcAnchor) {
+            const pct = (btcAnchor.progress * 100).toFixed(0);
+            const riskLabel = btcAnchor.level === 'HIGH'
+              ? 'High Risk'
+              : btcAnchor.level === 'MID'
+              ? 'Caution'
+              : 'Normal';
+            btcText = `BTC Cycle Pos: ${pct}% (${riskLabel})`;
+          }
+          let boxText = '';
+          if (phaseBoxStats) {
+            const avgBoxes = phaseBoxStats.avg.toFixed(1);
+            const curBoxNo = zi + 1;
+            boxText = `Avg Box Count: ${avgBoxes} / now #${curBoxNo}`;
+          }
+          if (isBtcChart) {
+            // 비트코인은 독립적으로 학습된다는 안내
+            boxText = (boxText ? boxText + ' · ' : '') + 'Based on BTC Historical Data Only';
+          }
+          if (btcText || boxText) {
+            reasonLine = `<div class="bt-row"><span class="bt-key" style="font-size:9px;opacity:0.7">Reason</span><span class="bt-val" style="font-size:9px;text-align:right;">${btcText}${btcText && boxText ? ' · ' : ''}${boxText}</span></div>`;
+          }
+        }
+
+        const highRiskCaution = isPrediction && btcAnchor && btcAnchor.level === 'HIGH';
+        let targetLine = '';
+        if (isPrediction) {
+          const targetLabel = isBear ? 'Target: Cycle Bottom' : 'Target: Next Peak';
+          targetLine = `<div class="bt-row"><span class="bt-key">Target</span><span class="bt-val">${targetLabel}</span></div>`;
+        }
+        let titleLabel = isBear ? 'BEAR Box' : 'BULL Box';
+        if (isPrediction && isBear) {
+          titleLabel = 'TREND CHANGING [!]';
+        }
+        const predBadge = isPrediction
+          ? ` <span style="color:${highRiskCaution ? '#ff4466' : '#00d4ff'};font-size:9px;opacity:0.8">[PREDICTION${highRiskCaution ? ' · CAUTION: BEAR TRANSITION' : ''}]</span>`
+          : '';
+        const hiRefLabel = isBear ? '현재박스 저점대비' : (zi === firstBullZi && cycleLow != null ? '최저점(CYCLE LOW)대비' : (prevBox ? '직전 박스 저점대비' : '100%대비'));
+        const loRefLabel = isBear ? (prevBox ? '직전 박스 고점대비' : '100%대비') : '현재 박스 고점대비';
+        tooltip.innerHTML = '<div class="bt-title" style="color:' + (isBear ? '#ff4466' : '#FFB800') + '">' + titleLabel + ' #' + (z.boxIndex != null ? z.boxIndex + 1 : zi + 1) + predBadge + '</div>' +
+          '<div class="bt-row"><span class="bt-key">고점</span><span class="bt-val">' + z.hi.toFixed(2) + '%</span>' + hiChg + '</div>' +
+          '<div class="bt-row"><span class="bt-key" style="font-size:9px;opacity:0.6">&nbsp;' + hiRefLabel + '</span></div>' +
+          '<div class="bt-row"><span class="bt-key">저점</span><span class="bt-val">' + z.lo.toFixed(2) + '%</span>' + loChg + '</div>' +
+          '<div class="bt-row"><span class="bt-key" style="font-size:9px;opacity:0.6">&nbsp;' + loRefLabel + '</span></div>' +
+          '<div class="bt-row"><span class="bt-key">기간</span><span class="bt-val">day ' + z.startX + '~' + z.endX + ' (' + (z.duration || '-') + '일)</span></div>' +
+          '<div class="bt-row"><span class="bt-key">Range</span><span class="bt-val">' + (z.rangePct || '0') + '%</span></div>' +
+          targetLine +
+          reasonLine +
+          '<div class="bt-row"><span class="bt-key">고점일</span><span class="bt-val">Day ' + hiDayDisp + (hiDateDisp ? ' (' + hiDateDisp + ')' : '') + '</span></div>' +
+          '<div class="bt-row"><span class="bt-key">저점일</span><span class="bt-val">Day ' + loDayDisp + (loDateDisp ? ' (' + loDateDisp + ')' : '') + '</span></div>';
+        const rect = chartEl.getBoundingClientRect();
+        tooltip.style.display = 'block';
+        let left = e.clientX - rect.left + 16;
+        let top  = e.clientY - rect.top  - 20;
+        if (left + 280 > rect.width)  left = e.clientX - rect.left - 290;
+        if (top < 0) top = 4;
+        if (top + 400 > rect.height)  top  = rect.height - 410;
+        tooltip.style.left = left + 'px';
+        tooltip.style.top  = top  + 'px';
+      });
+      dot.addEventListener('mousemove', (e) => {
+        const rect = chartEl.getBoundingClientRect();
+        let left = e.clientX - rect.left + 16;
+        let top  = e.clientY - rect.top  - 20;
+        if (left + 280 > rect.width)  left = e.clientX - rect.left - 290;
+        if (top < 0) top = 4;
+        tooltip.style.left = left + 'px';
+        tooltip.style.top  = top  + 'px';
+      });
+      dot.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+    });
+    });
+  }
+
+  // ── 사이클 저점 마크 (다이아몬드) ──
+  const lowD = cycleData[cycleLowIdx];
+  if (!lowD) return;
+  const xCL = timeScale.timeToCoordinate(lowD.x);
+  const yCL = series.priceToCoordinate(lowD.low);
+  if (xCL === null || yCL === null) return;
+
+  const diamond = document.createElement('div');
+  diamond.className = 'cycle-low-mark';
+  diamond.style.left = xCL + 'px';
+  diamond.style.top  = yCL + 'px';
+  overlay.appendChild(diamond);
+  boxMarkEls.push(diamond);
+
+  const clLabel = document.createElement('div');
+  clLabel.className = 'cycle-low-label';
+  clLabel.textContent = `▼ LOW ${lowD.low.toFixed(1)}%`;
+  clLabel.style.left = (xCL + 12) + 'px';
+  clLabel.style.top  = (yCL - 8) + 'px';
+  overlay.appendChild(clLabel);
+  boxMarkEls.push(clLabel);
+
+  diamond.style.pointerEvents = 'all';
+  diamond.addEventListener('mouseenter', (e) => {
+    tooltip.innerHTML = `
+      <div class="bt-title" style="color:#00d4ff">★ CYCLE LOW</div>
+      <div class="bt-row"><span class="bt-key">저점</span><span class="bt-val" style="color:#00d4ff">${lowD.low.toFixed(2)}%</span></div>
+      <div class="bt-row"><span class="bt-key">날짜</span><span class="bt-val">${lowD.date || ''}</span></div>
+      <div class="bt-row"><span class="bt-key">Day</span><span class="bt-val">${lowD.x}</span></div>
+    `;
+    const rect = chartEl.getBoundingClientRect();
+    tooltip.style.display = 'block';
+    let left = e.clientX - rect.left + 16;
+    let top  = e.clientY - rect.top  - 20;
+    if (left + 280 > rect.width)  left = e.clientX - rect.left - 290;
+    if (top < 0) top = 4;
+    if (top + 400 > rect.height)  top  = rect.height - 410;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top  = top  + 'px';
+  });
+  diamond.addEventListener('mousemove', (e) => {
+    const rect = chartEl.getBoundingClientRect();
+    let left = e.clientX - rect.left + 16;
+    let top  = e.clientY - rect.top  - 20;
+    if (left + 280 > rect.width)  left = e.clientX - rect.left - 290;
+    if (top < 0) top = 4;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top  = top  + 'px';
+  });
+  diamond.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+
+  // ── PEAK/BOTTOM 예측 마커: day_x, value 좌표로 오버레이에 표시 ─────
+  if (cycleRef && cycleRef.peak_predictions && cycleRef.peak_predictions.length > 0) {
+    cycleRef.peak_predictions.forEach(p => {
+      const dayX = p.day_x;
+      const val  = p.value != null ? p.value : 0;
+      const x    = timeScale.timeToCoordinate(dayX);
+      const y    = series.priceToCoordinate(val);
+      if (x == null || y == null) return;
+      const isPeak = p.type === 'PEAK';
+      const mk = document.createElement('div');
+      mk.style.position = 'absolute';
+      mk.style.left = x + 'px';
+      mk.style.top  = y + 'px';
+      mk.style.transform = 'translate(-50%, -50%)';
+      mk.style.pointerEvents = 'none';
+      mk.style.zIndex = '22';
+      mk.style.fontSize = '14px';
+      mk.style.fontWeight = '700';
+      mk.style.color = isPeak ? '#ff4466' : '#00ff88';
+      mk.style.textShadow = '0 0 4px rgba(0,0,0,0.8)';
+      mk.textContent = isPeak ? '▲' : '▼';
+      overlay.appendChild(mk);
+      boxMarkEls.push(mk);
+      const lbl = document.createElement('div');
+      lbl.style.position = 'absolute';
+      lbl.style.left = (x + 10) + 'px';
+      lbl.style.top = y + 'px';
+      lbl.style.transform = 'translateY(-50%)';
+      lbl.style.fontSize = '10px';
+      lbl.style.fontWeight = '600';
+      lbl.style.color = isPeak ? '#ff4466' : '#00ff88';
+      lbl.style.whiteSpace = 'nowrap';
+      lbl.style.pointerEvents = 'none';
+      lbl.style.zIndex = '22';
+      lbl.textContent = (typeof val === 'number' ? val.toFixed(1) : val) + '%';
+      overlay.appendChild(lbl);
+      boxMarkEls.push(lbl);
+    });
+  }
+
+  // ── 예측 경로 끝 표시: Bull 끝 "BULL 예측", Bear 끝 "BEAR 예측" ─────────
+  if (cycleRef && cycleRef.prediction_paths) {
+    const bullPts = cycleRef.prediction_paths.bull;
+    const bearPts = cycleRef.prediction_paths.bear;
+    if (bullPts && bullPts.length > 1) {
+      const lastU = bullPts[bullPts.length - 1];
+      const xU = timeScale.timeToCoordinate(lastU.x);
+      const yU = series.priceToCoordinate(lastU.value);
+      if (xU != null && yU != null) {
+        const endMark = document.createElement('div');
+        endMark.className = 'pred-path-end';
+        endMark.textContent = 'BULL 예측';
+        endMark.style.color = 'rgba(255,217,102,0.95)';
+        endMark.style.left = (xU + 4) + 'px';
+        endMark.style.top = yU + 'px';
+        overlay.appendChild(endMark);
+        boxMarkEls.push(endMark);
+      }
+    }
+    if (bearPts && bearPts.length > 1) {
+      const lastB = bearPts[bearPts.length - 1];
+      const xEnd = timeScale.timeToCoordinate(lastB.x);
+      const yEnd = series.priceToCoordinate(lastB.value);
+      if (xEnd != null && yEnd != null) {
+        const endMark = document.createElement('div');
+        endMark.className = 'pred-path-end';
+        endMark.textContent = 'BEAR 예측';
+        endMark.style.color = 'rgba(255,107,107,0.95)';
+        endMark.style.left = (xEnd + 4) + 'px';
+        endMark.style.top = yEnd + 'px';
+        overlay.appendChild(endMark);
+        boxMarkEls.push(endMark);
+      }
+    }
+  }
+}
+
+
+function clearBearBullLabels() {
+  const overlay = document.getElementById('bearBullOverlay');
+  if (overlay) overlay.innerHTML = '';
+  bearBullLabels = [];
+}
+
+function renderBearBullLabels(segments, timeScale, series) {
+  clearBearBullLabels();
+  if (!showBearBull || segments.length === 0) return;
+  const overlay = document.getElementById('bearBullOverlay');
+  segments.forEach(seg => {
+    const midDay   = Math.round((seg.startX + seg.endX) / 2);
+    const x        = timeScale.timeToCoordinate(midDay);
+    const midPrice = (seg.startVal + seg.endVal) / 2;
+    const y        = series ? series.priceToCoordinate(midPrice) : null;
+    if (x === null || y === null) return;
+    const lbl = document.createElement('div');
+    lbl.className = `bb-label ${seg.type === 'BEAR' ? 'bb-bear' : 'bb-bull'}`;
+    lbl.style.left = (x - 40) + 'px';
+    lbl.style.top  = (y - 12) + 'px';
+    lbl.innerHTML  = `${seg.type} <span style="font-size:9px;opacity:0.7">${seg.days}d / ${seg.pct}%</span>`;
+    overlay.appendChild(lbl);
+    bearBullLabels.push(lbl);
+  });
+}
+
+function toggleBearBull() {
+  showBearBull = !showBearBull;
+  const btn = document.getElementById('toggleBearBull');
+  btn.style.cssText = showBearBull
+    ? 'border-color:#a0f0c0;color:#a0f0c0;background:rgba(0,255,136,0.08)'
+    : 'border-color:#4a6080;color:#4a6080;';
+  drawChart();
+}
+
+// ── Draw Chart ────────────────────────────────────────
+function drawChart() {
+  Object.values(seriesMap).forEach(s => { try { chart.removeSeries(s); } catch(e){} });
+  seriesMap = {};
+  seriesMetaMap = {};
+  clearBearBullLabels();
+  clearBoxMarks();
+  boxMarksData = [];
+  buildCycleToggles();
+
+  if (selectedCoins.length === 0) {
+    updateLegend([]);
+    updateStats([]);
+    return;
+  }
+
+  const legendItems = [];
+
+  selectedCoins.forEach((coinId, coinIdx) => {
+    const coinData  = ALL_DATA[coinId];
+    if (!coinData) return;
+    const baseColor = COIN_COLORS[coinIdx % COIN_COLORS.length];
+
+    coinData.cycles.forEach(cycle => {
+      if (!activeCycles.has(cycle.cycle_number)) return;
+
+      const col    = CYCLE_COLORS[cycle.cycle_number] || CYCLE_COLORS[1];
+      const color  = selectedCoins.length > 1 ? baseColor : col.main;
+      const isCurr = cycle.cycle_name.toLowerCase().includes('current');
+
+      const lineSeries = chart.addLineSeries({
+        color,
+        lineWidth:   selectedCoins.length > 1 ? 1.5 : 2,
+        lineStyle:   isCurr ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: true,
+      });
+
+      let cycleMinLowVal = Infinity, cycleMinLowIdx = 0;
+      cycle.data.forEach((d, idx) => {
+        if (d.low < cycleMinLowVal) { cycleMinLowVal = d.low; cycleMinLowIdx = idx; }
+      });
+      const lineData = cycle.data.map((d, idx) => ({
+        time:  d.x,
+        value: idx <= cycleMinLowIdx ? d.low : d.high,
+      }));
+      lineSeries.setData(lineData);
+      const closeKey = `${coinId}_${cycle.cycle_number}_close`;
+      seriesMap[closeKey]     = lineSeries;
+      seriesMetaMap[closeKey] = { coinId, cycle };
+
+      // ── PEAK/BOTTOM 예측 마커: setMarkers 제거(시리즈 값 기준이라 위치 오류).
+      //    대신 오버레이에서 day_x, value 좌표로 직접 그림 (renderBoxMarks에서 처리).
+      if (showHighLow) {
+        const hiSeries = chart.addLineSeries({
+          color: color + '55', lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dotted,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        });
+        hiSeries.setData(cycle.data.map(d => ({ time: d.x, value: d.high })));
+        seriesMap[`${coinId}_${cycle.cycle_number}_hi`] = hiSeries;
+
+        const loSeries = chart.addLineSeries({
+          color: color + '55', lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dotted,
+          priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        });
+        loSeries.setData(cycle.data.map(d => ({ time: d.x, value: d.low })));
+        seriesMap[`${coinId}_${cycle.cycle_number}_lo`] = loSeries;
+      }
+
+      // ── 박스존 렌더링 ─────────────────────────────────────────────────
+      // ★ DB 데이터 우선 사용. 없으면 JS detectBoxZones 폴백.
+      if (showBoxZone) {
+        const hasDbZones = cycle.box_zones && cycle.box_zones.length > 0;
+        const zones = hasDbZones ? cycle.box_zones : detectBoxZones(cycle.data);
+
+        console.log(
+          '[BOX] ' + coinData.symbol + ' ' + cycle.cycle_name + ' — ' + zones.length + '개 박스'
+          + ' (' + (hasDbZones ? 'DB' : 'JS 폴백') + ')'
+        );
+
+        zones.forEach((z, zi) => {
+          const isPred    = z.is_prediction === 1;
+          const isBearBox = z.phase === 'BEAR';
+
+          let lineColor, fillTop, fillBot;
+          if (isPred) {
+            // 예측 박스: 실제보다 밝은 빨강(BEAR) / 밝은 노랑(BULL)
+            const baseRGB = isBearBox ? '255,107,107' : '255,217,102';
+            lineColor = `rgba(${baseRGB},0.80)`;
+            fillTop   = `rgba(${baseRGB},0.10)`;
+            fillBot   = `rgba(${baseRGB},0.01)`;
+          } else {
+            const baseRGB = isBearBox ? '255,68,102' : '255,184,0';
+            lineColor = `rgba(${baseRGB},0.85)`;
+            fillTop   = `rgba(${baseRGB},0.14)`;
+            fillBot   = `rgba(${baseRGB},0.04)`;
+          }
+
+          console.log(
+            '  Box #' + (z.boxIndex != null ? z.boxIndex + 1 : zi + 1) + ' [' + z.phase + (isPred ? ' PRED' : '') + ']'
+            + ' day ' + z.startX + '~' + z.endX + ' (' + (z.duration != null ? z.duration : '-') + '일)'
+            + ' | hi:' + z.hi.toFixed(2) + '% lo:' + z.lo.toFixed(2) + '%'
+            + ' range:' + (z.rangePct || '0') + '% | result:' + (z.result || '')
+          );
+
+          const hiLine = chart.addLineSeries({
+            color: lineColor, lineWidth: isPred ? 1 : 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            priceLineVisible: false, lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          hiLine.setData([{ time: z.startX, value: z.hi },
+                          { time: z.endX,   value: z.hi }]);
+          seriesMap[`${coinId}_${cycle.cycle_number}_bhi${zi}`] = hiLine;
+
+          const loLine = chart.addLineSeries({
+            color: lineColor, lineWidth: isPred ? 1 : 1.5,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            priceLineVisible: false, lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          loLine.setData([{ time: z.startX, value: z.lo },
+                          { time: z.endX,   value: z.lo }]);
+          seriesMap[`${coinId}_${cycle.cycle_number}_blo${zi}`] = loLine;
+
+          const fillSeries = chart.addAreaSeries({
+            topColor: fillTop, bottomColor: fillBot,
+            lineColor: 'rgba(0,0,0,0)', lineWidth: 0,
+            priceLineVisible: false, lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          fillSeries.applyOptions({ baseValue: { type: 'price', price: z.lo } });
+          fillSeries.setData([{ time: z.startX, value: z.hi },
+                              { time: z.endX,   value: z.hi }]);
+          seriesMap[`${coinId}_${cycle.cycle_number}_bfill${zi}`] = fillSeries;
+        });
+
+        boxMarksData.push({
+          zones,
+          cycleLowIdx:  cycleMinLowIdx,
+          cycleData:    cycle.data,
+          seriesKey:    closeKey,
+          coinId:       coinId,
+          symbol:       coinData.symbol,
+          cycleNumber:  cycle.cycle_number,
+          cycleRef:     cycle,
+        });
+        setTimeout(() => {
+          const ts = chart.timeScale();
+          renderBoxMarks(
+            zones,
+            cycleMinLowIdx,
+            cycle.data,
+            ts,
+            lineSeries,
+            coinId,
+            coinData.symbol,
+            cycle.cycle_number,
+            cycle
+          );
+        }, 80);
+      } else {
+        boxMarksData.push({
+          zones: [],
+          cycleLowIdx:  cycleMinLowIdx,
+          cycleData:    cycle.data,
+          seriesKey:    closeKey,
+          coinId:       coinId,
+          symbol:       coinData.symbol,
+          cycleNumber:  cycle.cycle_number,
+          cycleRef:     cycle,
+        });
+        setTimeout(() => {
+          const ts = chart.timeScale();
+          renderBoxMarks(
+            [],
+            cycleMinLowIdx,
+            cycle.data,
+            ts,
+            lineSeries,
+            coinId,
+            coinData.symbol,
+            cycle.cycle_number,
+            cycle
+          );
+        }, 80);
+      }
+      // ── ACTIVE 박스 잔여 구간 점선 연장 ─────────────────────────────────
+      // result='BEAR_ACTIVE' or 'BULL_ACTIVE' 인 박스:
+      // 실데이터 마지막 날 close → 박스 hi → 박스 lo 를 점선으로 연결
+      if (cycle.box_zones) {
+        const lastRealDay   = cycle.data[cycle.data.length - 1]?.x ?? 0;
+        const lastRealClose = cycle.data[cycle.data.length - 1]?.close ?? 100;
+
+        cycle.box_zones.forEach(z => {
+          const isAct = (z.result === 'BEAR_ACTIVE' || z.result === 'BULL_ACTIVE');
+          if (!isAct) return;                        // ACTIVE 박스만
+          if (z.endX <= lastRealDay) return;         // 실데이터가 이미 박스 끝을 넘은 경우 제외
+
+          const actBear  = z.result === 'BEAR_ACTIVE';
+          const actColor = actBear ? 'rgba(255,80,100,0.80)' : 'rgba(255,184,0,0.80)';
+          const dur      = z.endX - z.startX;
+          const hiDay    = z.hiDay != null ? z.hiDay : z.startX + Math.floor(dur / 4);
+          const loDay    = z.loDay != null ? z.loDay : z.startX + Math.floor(dur * 3 / 4);
+
+          // 실데이터 끝점 → hi → lo 순으로 꺾은선 좌표 구성
+          const pts = [{ time: lastRealDay, value: lastRealClose }];
+
+          if (actBear) {
+            // BEAR: 반등(hi) 후 하락(lo)
+            if (hiDay > lastRealDay) pts.push({ time: hiDay, value: z.hi });
+            if (loDay > lastRealDay && loDay > (pts[pts.length-1]?.time ?? 0))
+              pts.push({ time: loDay, value: z.lo });
+          } else {
+            // BULL: 하락(lo) 후 반등(hi)
+            if (loDay > lastRealDay) pts.push({ time: loDay, value: z.lo });
+            if (hiDay > lastRealDay && hiDay > (pts[pts.length-1]?.time ?? 0))
+              pts.push({ time: hiDay, value: z.hi });
+          }
+
+          if (pts.length > 1) {
+            const actSeries = chart.addLineSeries({
+              color: actColor,
+              lineWidth: 1,
+              lineStyle: LightweightCharts.LineStyle.Dashed,
+              priceLineVisible: false,
+              lastValueVisible: false,
+              crosshairMarkerVisible: false,
+            });
+            actSeries.setData(pts);
+            seriesMap[`${coinId}_${cycle.cycle_number}_active_${z.boxIndex}`] = actSeries;
+          }
+        });
+      }
+
+      // ── 예측 경로 렌더링 (bull: 노란색 점선, bear: 빨간색 점선) ──────────
+      // Box3(144일) 종료 이후부터 예측, 실데이터 마지막 점과 연결
+      if (cycle.prediction_paths) {
+        const lastRealDay   = cycle.data[cycle.data.length - 1]?.x ?? 0;
+        const lastRealClose = cycle.data[cycle.data.length - 1]?.close ?? 100;
+        const prependReal = (pts) => {
+          if (!pts || pts.length < 1) return pts;
+          const first = pts[0];
+          if (first.x > lastRealDay) {
+            return [{ x: lastRealDay, value: lastRealClose }, ...pts];
+          }
+          return pts;
+        };
+
+        const bearPts = prependReal(cycle.prediction_paths.bear);
+        // Bull은 Bear가 있을 때 real을 붙이지 않음 → Bear 종료점(bridge)에서 시작해 상승만 그리기
+        const hasBear = bearPts && bearPts.length > 1;
+        const bullPts = hasBear
+          ? (cycle.prediction_paths.bull || [])
+          : prependReal(cycle.prediction_paths.bull);
+
+        if (bullPts && bullPts.length > 1) {
+          const bullPath = chart.addLineSeries({
+            color: 'rgba(255,217,102,0.85)',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          bullPath.setData(bullPts.map(p => ({ time: p.x, value: p.value })));
+          seriesMap[`${coinId}_${cycle.cycle_number}_path_bull`] = bullPath;
+        }
+
+        if (bearPts && bearPts.length > 1) {
+          const bearPath = chart.addLineSeries({
+            color: 'rgba(255,107,107,0.85)',
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dotted,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          bearPath.setData(bearPts.map(p => ({ time: p.x, value: p.value })));
+          seriesMap[`${coinId}_${cycle.cycle_number}_path_bear`] = bearPath;
+        }
+      }
+
+      if (showBearBull && selectedCoins.length === 1) {
+        const segs = detectBearBull(cycle.data);
+        segs.forEach((seg, si) => {
+          const bgColor = seg.type === 'BEAR' ? 'rgba(255,68,102,0.07)' : 'rgba(0,255,136,0.07)';
+          const lineCol = seg.type === 'BEAR' ? 'rgba(255,68,102,0.0)' : 'rgba(0,255,136,0.0)';
+          const bgSeries = chart.addAreaSeries({
+            topColor: bgColor, bottomColor: bgColor, lineColor: lineCol, lineWidth: 0,
+            priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+          });
+          const allVals = cycle.data.map(d => d.close);
+          const maxV = Math.max(...allVals) * 1.05;
+          bgSeries.setData([
+            { time: seg.startX, value: maxV },
+            { time: seg.endX,   value: maxV },
+          ]);
+          seriesMap[`${coinId}_${cycle.cycle_number}_bb${si}`] = bgSeries;
+        });
+        setTimeout(() => {
+          const ts    = chart.timeScale();
+          const segs2 = detectBearBull(cycle.data);
+          renderBearBullLabels(segs2, ts, lineSeries);
+        }, 80);
+      }
+
+      legendItems.push({
+        color,
+        label: selectedCoins.length > 1
+          ? `${coinData.symbol} · ${cycle.cycle_name}`
+          : cycle.cycle_name,
+        peak: cycle.peak_date,
+        isCurr,
+      });
+    });
+  });
+
+  updateLegend(legendItems);
+  updateStats();
+  initBottomOverrideUI();
+  chart.timeScale().fitContent();
+}
+
+// ── Legend ────────────────────────────────────────────
+function updateLegend(items) {
+  const el = document.getElementById('legend');
+  if (items.length === 0) { el.style.display='none'; return; }
+  el.style.display = 'block';
+  const singleCoin = selectedCoins.length === 1 ? ALL_DATA[selectedCoins[0]] : null;
+  const coinLabel = singleCoin
+    ? (singleCoin.symbol || '') + '/USDT'
+    : `${selectedCoins.length} COINS`;
+  const isBtcSingle = singleCoin && (singleCoin.symbol || '').toUpperCase() === 'BTC';
+  const btcNote = isBtcSingle
+    ? `<div style="font-size:9px;color:#4a6080;letter-spacing:0.5px;margin-top:2px;">Based on BTC Historical Data Only</div>`
+    : '';
+  el.innerHTML = `<div class="legend-title">${coinLabel}</div>${btcNote}` +
+    items.map(i => `
+      <div class="legend-item">
+        <div class="legend-dot" style="background:${i.color}"></div>
+        <div>
+          <div>${i.label}${i.isCurr ? ' <span style="color:#FFB800;font-size:9px">●LIVE</span>':''}</div>
+          <div class="legend-info">Peak: ${i.peak}</div>
+        </div>
+      </div>
+    `).join('') +
+    `<div class="legend-item"><span style="font-size:12px">🟡</span><div><div>Bull 예측 (점선)</div><div class="legend-info">노란색</div></div></div>` +
+    `<div class="legend-item"><span style="font-size:12px">🔴</span><div><div>Bear 예측 (점선)</div><div class="legend-info">빨간색</div></div></div>`;
+}
+
+// ── Stats Bar ─────────────────────────────────────────
+function updateStats() {
+  const el = document.getElementById('statsBar');
+  if (selectedCoins.length !== 1) { el.innerHTML=''; return; }
+  const coinData = ALL_DATA[selectedCoins[0]];
+  if (!coinData) return;
+  let html = '';
+  coinData.cycles.forEach(cycle => {
+    if (!activeCycles.has(cycle.cycle_number)) return;
+    if (!cycle.data || cycle.data.length === 0) {
+      html += `
+      <div class="stat-item">
+        <div class="stat-label">${(cycle.cycle_name || '').toUpperCase()}</div>
+        <div class="stat-label" style="margin-top:2px">Peak: ${cycle.peak_date || '-'}</div>
+      </div>
+      <div class="stat-item"><div class="stat-label">실측 가격 데이터 없음</div></div>
+      `;
+      return;
+    }
+    const minRate  = Math.min(...cycle.data.map(d=>d.close));
+    const minDay   = cycle.data.find(d=>d.close===minRate)?.x ?? '-';
+    const maxDays  = cycle.data[cycle.data.length-1]?.x ?? '-';
+    const lastRate = cycle.data[cycle.data.length-1]?.close ?? 0;
+    const isDown   = lastRate < 100;
+    html += `
+      <div class="stat-item">
+        <div class="stat-label">${cycle.cycle_name.toUpperCase()}</div>
+        <div class="stat-label" style="margin-top:2px">Peak: ${cycle.peak_date}</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-label">BOTTOM</div>
+        <div class="stat-value down">${minRate.toFixed(1)}%</div>
+        <div class="stat-label">day ${minDay}</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-label">DURATION</div>
+        <div class="stat-value">${maxDays}d</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-label">CURRENT</div>
+        <div class="stat-value ${isDown?'down':'up'}">${lastRate.toFixed(1)}%</div>
+      </div>
+    `;
+  });
+  el.innerHTML = html;
+}
+
+// ── Crosshair Tooltip ─────────────────────────────────
+function findBoxAtDay(dayX, coinId, cycleNum) {
+  for (const bmd of boxMarksData) {
+    if (bmd.seriesKey !== `${coinId}_${cycleNum}_close`) continue;
+    const firstBullZi = bmd.zones.findIndex(z => z.phase === 'BULL');
+    for (let zi = 0; zi < bmd.zones.length; zi++) {
+      const z = bmd.zones[zi];
+      if (dayX >= z.startX && dayX <= z.endX) {
+        const prev     = bmd.zones[zi - 1] || null;
+        const cycleLow = bmd.cycleData[bmd.cycleLowIdx]?.low ?? null;
+        return { zone: z, index: zi, prev, cycleLow, firstBullZi };
+      }
+    }
+  }
+  return null;
+}
+
+function setupTooltip() {
+  const tooltip = document.getElementById('crosshairTooltip');
+  const chartEl = document.getElementById('chart');
+
+  chart.subscribeCrosshairMove(param => {
+    if (!param || !param.time || param.point === undefined) {
+      tooltip.style.display = 'none'; return;
+    }
+    const dayX = param.time;
+    const rows = [];
+    Object.entries(seriesMetaMap).forEach(([key, meta]) => {
+      const series    = seriesMap[key];
+      if (!series) return;
+      const dataPoint = param.seriesData.get(series);
+      if (!dataPoint) return;
+      const cycle  = meta.cycle;
+      const coinId = meta.coinId;
+      const coin   = ALL_DATA[coinId];
+      const found  = cycle.data.find(d => d.x === dayX);
+      const date   = found ? found.date : '';
+      const col    = CYCLE_COLORS[cycle.cycle_number] || CYCLE_COLORS[1];
+      const color  = selectedCoins.length > 1
+        ? COIN_COLORS[selectedCoins.indexOf(coinId) % COIN_COLORS.length]
+        : col.main;
+      const boxInfo = showBoxZone ? findBoxAtDay(dayX, coinId, cycle.cycle_number) : null;
+      rows.push({ color, coin, cycle, coinId, dayX, date, val: dataPoint.value, boxInfo });
+    });
+
+    if (rows.length === 0) { tooltip.style.display = 'none'; return; }
+
+    let html = `<div class="tt-day">Day ${dayX}</div>`;
+    rows.forEach(r => {
+      const label = selectedCoins.length > 1
+        ? `${r.coin.symbol} · ${r.cycle.cycle_name}`
+        : r.cycle.cycle_name;
+      html += `
+        <div class="tt-row">
+          <div class="tt-dot" style="background:${r.color}"></div>
+          <div class="tt-label">${label}</div>
+          <div>
+            <div class="tt-val">${r.val.toFixed(2)}%</div>
+            ${r.date ? `<div class="tt-date">${r.date}</div>` : ''}
+          </div>
+        </div>`;
+
+      if (r.boxInfo) {
+        const z          = r.boxInfo.zone;
+        const zi         = r.boxInfo.index;
+        const prev       = r.boxInfo.prev;
+        const cycleLow   = r.boxInfo.cycleLow ?? null;
+        const firstBullZi = r.boxInfo.firstBullZi ?? -1;
+        const isBear     = z.phase === 'BEAR';
+        const isPred     = z.is_prediction === 1;
+        const boxColor   = isBear ? '#ff4466' : '#FFB800';
+        const dayInBox   = dayX - z.startX + 1;
+        // REFACTORED: Korean label text extracted to separate variables to prevent
+        // escape-chain corruption when embedded inside nested template literals
+        const hiLabel = isBear
+          ? '현재박스 저점 대비'
+          : (zi === firstBullZi && cycleLow != null ? '사이클저점 대비' : (prev ? '직전박스 저점 대비' : ''));
+        const loLabel = isBear ? '직전박스 고점 대비' : '현재박스 고점 대비';
+
+        // REFACTORED: use string concatenation (not template literals) to avoid
+        // Korean character corruption from nested escape sequences
+        let hiChg = '', loChg = '';
+        if (isBear) {
+          const hiVsLo = ((z.hi - z.lo) / z.lo * 100).toFixed(1);
+          const hiColor = parseFloat(hiVsLo) >= 0 ? '#00ff88' : '#ff4466';
+          const hiSign  = parseFloat(hiVsLo) >= 0 ? '+' : '';
+          hiChg = '<span style="color:' + hiColor + ';margin-left:6px">' + hiSign + hiVsLo + '%</span>'
+                + (hiLabel ? ' <span style="color:#4a6080;font-size:9px">(' + hiLabel + ')</span>' : '');
+          if (prev) {
+            const loVsHi = ((z.lo - prev.hi) / prev.hi * 100).toFixed(1);
+            const loColor = parseFloat(loVsHi) >= 0 ? '#00ff88' : '#ff4466';
+            const loSign  = parseFloat(loVsHi) >= 0 ? '+' : '';
+            loChg = '<span style="color:' + loColor + ';margin-left:6px">' + loSign + loVsHi + '%</span>'
+                  + ' <span style="color:#4a6080;font-size:9px">(' + loLabel + ')</span>';
+          }
+        } else {
+          const loVsHi = ((z.lo - z.hi) / z.hi * 100).toFixed(1);
+          const loColor = parseFloat(loVsHi) >= 0 ? '#00ff88' : '#ff4466';
+          const loSign  = parseFloat(loVsHi) >= 0 ? '+' : '';
+          loChg = '<span style="color:' + loColor + ';margin-left:6px">' + loSign + loVsHi + '%</span>'
+                + ' <span style="color:#4a6080;font-size:9px">(' + loLabel + ')</span>';
+          const refLow = (zi === firstBullZi && cycleLow != null) ? cycleLow : (prev ? prev.lo : null);
+          if (refLow != null) {
+            const hiVsLo = ((z.hi - refLow) / refLow * 100).toFixed(1);
+            const hiColor = parseFloat(hiVsLo) >= 0 ? '#00ff88' : '#ff4466';
+            const hiSign  = parseFloat(hiVsLo) >= 0 ? '+' : '';
+            hiChg = '<span style="color:' + hiColor + ';margin-left:6px">' + hiSign + hiVsLo + '%</span>'
+                  + (hiLabel ? ' <span style="color:#4a6080;font-size:9px">(' + hiLabel + ')</span>' : '');
+          }
+        }
+        // REFACTORED: parseFloat rangePct (Python sends as string) to guarantee numeric display
+        const rpNum = parseFloat(z.rangePct);
+        const rpStr = isNaN(rpNum) ? '0.0' : rpNum.toFixed(1);
+        html += `
+        <div style="margin:4px 0 2px;padding:6px 8px;background:rgba(${isBear?'255,68,102':'255,184,0'},${isPred?'0.04':'0.08'});border:1px solid rgba(${isBear?'255,68,102':'255,184,0'},${isPred?'0.15':'0.25'});border-radius:4px;${isPred?'border-style:dashed;':''}">
+          <div style="font-size:10px;font-weight:700;color:${boxColor};margin-bottom:4px;letter-spacing:1px;">${z.phase} Box #${z.boxIndex != null ? z.boxIndex+1 : zi+1}${isPred?' <span style="color:#00d4ff;font-size:9px">[PRED]</span>':''}</div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;margin:2px 0;"><span style="color:#4a6080">고점</span><span style="color:#fff;font-weight:600">${z.hi.toFixed(2)}%</span>${hiChg}</div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;margin:2px 0;"><span style="color:#4a6080">저점</span><span style="color:#fff;font-weight:600">${z.lo.toFixed(2)}%</span>${loChg}</div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;margin:2px 0;"><span style="color:#4a6080">기간</span><span style="color:#fff;">day ${z.startX}~${z.endX} (${z.duration ?? '-'}일)</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;margin:2px 0;"><span style="color:#4a6080">현위치</span><span style="color:#fff;">${dayInBox}/${z.duration ?? '-'}일</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;margin:2px 0;"><span style="color:#4a6080">Range</span><span style="color:#fff;">${rpStr}%</span></div>
+        </div>`;
+      }
+    });
+
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    const rect = chartEl.getBoundingClientRect();
+    let left   = param.point.x + 16;
+    let top    = param.point.y - 20;
+    if (left + 260 > rect.width) left = param.point.x - 280;
+    if (top < 0) top = 4;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top  = top  + 'px';
+  });
+}
+
+// ── Search ────────────────────────────────────────────
+document.getElementById('searchInput').addEventListener('input', e => {
+  buildCoinList(e.target.value);
+});
+
+// ── Boot ──────────────────────────────────────────────
+function initDefaults() {
+  // 기본 코인: BTC 자동 선택 (이미 selectedCoins 에 세팅되어 있음)
+  // 기본 사이클: BTC 의 CURRENT / 최신 사이클만 활성화
+  if (BTC_COIN_ID && ALL_DATA[BTC_COIN_ID]?.cycles) {
+    const btcCycles = ALL_DATA[BTC_COIN_ID].cycles;
+    let curr = btcCycles.find(c => (c.cycle_name || '').toLowerCase().includes('current'));
+    if (!curr) {
+      curr = btcCycles[btcCycles.length - 1];
+    }
+    if (curr) {
+      activeCycles = new Set([curr.cycle_number]);
+    }
+  }
+  // BOX ZONE 기본 활성화 버튼 스타일 동기화
+  const boxBtn = document.getElementById('toggleBox');
+  if (boxBtn) {
+    boxBtn.style.cssText = 'border-color:#FFB800;color:#FFB800;background:rgba(255,184,0,0.1)';
+  }
+}
+
+initChart();
+setupTooltip();
+initDefaults();
+buildCoinList();
+buildCycleToggles();
+
+// ── 저점 설정 UI ─────────────────────────────────────────
+// BOTTOM 예측값을 찾아서 입력창 초기값으로 세팅 (전역 함수)
+function initBottomOverrideUI() {
+  const coinId = selectedCoins[0];
+  if (!coinId) return;
+  const coinData = ALL_DATA[coinId];
+  if (!coinData) return;
+  const cycles = coinData.cycles || [];
+  for (let i = cycles.length - 1; i >= 0; i--) {
+    const bottom = (cycles[i].peak_predictions || [])
+      .find(p => p.type === 'BOTTOM');
+    if (bottom) {
+      document.getElementById('overrideBottomLo').value
+        = bottom.value.toFixed(1);
+      document.getElementById('overrideBottomDay').value
+        = bottom.day_x;
+      return;
+    }
+  }
+}
+
+// 각 코인×사이클의 bear path 원본 데이터 저장소 (초기화용)
+const _origBearPaths = {};
+
+function _saveBearPathsIfNeeded() {
+  const coinId = selectedCoins[0];
+  if (!coinId) return;
+  const coinData = ALL_DATA[coinId];
+  if (!coinData) return;
+  for (const cycle of (coinData.cycles || [])) {
+    const key = `${coinId}_${cycle.cycle_number}`;
+    if (_origBearPaths[key]) continue;
+    let bearPts = cycle.prediction_paths?.bear;
+    if (!bearPts || bearPts.length < 1) continue;
+    const lastRealDay   = cycle.data?.[cycle.data.length - 1]?.x ?? 0;
+    const lastRealClose = cycle.data?.[cycle.data.length - 1]?.close ?? 100;
+    if (bearPts[0].x > lastRealDay) {
+      bearPts = [{ x: lastRealDay, value: lastRealClose }, ...bearPts];
+    }
+    if (bearPts.length > 1) {
+      _origBearPaths[key] = bearPts.map(p => ({ x: p.x, value: p.value }));
+    }
+  }
+}
+
+function applyBottomOverride(newLo, newDay) {
+  const coinId = selectedCoins[0];
+  if (!coinId) return;
+  const coinData = ALL_DATA[coinId];
+  if (!coinData) return;
+  _saveBearPathsIfNeeded();
+
+  for (const cycle of (coinData.cycles || [])) {
+    const seriesKey = `${coinId}_${cycle.cycle_number}_path_bear`;
+    if (!seriesMap[seriesKey]) continue;
+
+    const origKey = `${coinId}_${cycle.cycle_number}`;
+    const origPts = _origBearPaths[origKey];
+    if (!origPts || origPts.length < 2) continue;
+
+    const origFirst = origPts[0];
+    const origLast  = origPts[origPts.length - 1];
+    const targetLo  = (newLo  != null) ? newLo  : origLast.value;
+    const targetDay = (newDay != null) ? newDay : origLast.x;
+
+    const origTotalDays = origLast.x - origFirst.x;
+    const newTotalDays  = Math.max(1, targetDay - origFirst.x);
+    const valRange      = origFirst.value - origLast.value;
+
+    const newPts = origPts.map(p => {
+      const tRatio = origTotalDays > 0
+        ? (p.x - origFirst.x) / origTotalDays : 0;
+      const newX   = Math.round(origFirst.x + tRatio * newTotalDays);
+      const newVal = valRange > 0
+        ? origFirst.value - (origFirst.value - p.value) / valRange * (origFirst.value - targetLo)
+        : p.value;
+      return { time: newX, value: newVal };
+    });
+
+    // 저점 설정 시 경로가 (targetDay, targetLo)를 반드시 지나가도록 보정
+    const hasExact = newPts.some(p => p.time === targetDay);
+    if (!hasExact) {
+      const insert = { time: targetDay, value: targetLo };
+      newPts.push(insert);
+      newPts.sort((a, b) => a.time - b.time);
+    }
+    const idx = newPts.findIndex(p => p.time === targetDay);
+    if (idx >= 0) {
+      newPts[idx] = { time: targetDay, value: targetLo };
+    }
+    // 시간 중복 제거 (같은 day면 마지막 것만 유지)
+    const byTime = {};
+    newPts.forEach(p => { byTime[p.time] = p; });
+    const finalPts = Object.keys(byTime)
+      .sort((a, b) => Number(a) - Number(b))
+      .map(t => ({ time: Number(t), value: byTime[t].value }));
+
+    seriesMap[seriesKey].setData(finalPts.map(p => ({ time: p.time, value: p.value })));
+  }
+}
+
+document.getElementById('applyBottomOverride')
+  .addEventListener('click', () => {
+    const newLo  = parseFloat(
+      document.getElementById('overrideBottomLo').value);
+    const newDay = parseInt(
+      document.getElementById('overrideBottomDay').value);
+    if (isNaN(newLo) || isNaN(newDay)) {
+      alert('저점가(%)와 저점일을 입력하세요.'); return;
+    }
+    applyBottomOverride(newLo, newDay);
+  });
+
+document.getElementById('resetBottomOverride')
+  .addEventListener('click', () => {
+    applyBottomOverride(null, null);
+    initBottomOverrideUI();
+  });

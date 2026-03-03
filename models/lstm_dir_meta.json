@@ -1,0 +1,28 @@
+{
+  "features": [
+    "cycle_progress",
+    "days_from_bottom",
+    "range_pct",
+    "btc_box_num",
+    "duration_days",
+    "box_number",
+    "low_rate",
+    "phase_enc",
+    "mid_rate",
+    "high_rate",
+    "breakout_rate_lag1",
+    "consec_downs"
+  ],
+  "seq_len": 8,
+  "input_size": 12,
+  "hidden_size": 128,
+  "num_layers": 2,
+  "dropout": 0.4,
+  "best_epoch": 36,
+  "best_val_acc": 67.34,
+  "test_acc": 68.35,
+  "test_f1": 68.24,
+  "test_prec": 69.66,
+  "test_rec": 66.89,
+  "test_dn_acc": 69.86
+}
